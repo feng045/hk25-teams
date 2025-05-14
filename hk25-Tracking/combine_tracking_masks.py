@@ -243,56 +243,63 @@ def setup_logging():
     logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 
-if __name__ == "__main__":
-    # Set up logging
-    setup_logging()
-    logger = logging.getLogger(__name__)
+def setup_dask_client(parallel, n_workers, threads_per_worker, logger=None):
+    """
+    Set up a Dask client for parallel processing
+    
+    Args:
+        parallel: bool
+            Whether to use parallel processing
+        n_workers: int
+            Number of workers for the Dask cluster
+        threads_per_worker: int
+            Number of threads per worker
+        logger: logging.Logger, optional
+            Logger for status messages
+            
+    Returns:
+        dask.distributed.Client or None: Dask client if parallel is True, None otherwise
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    if not parallel:
+        logger.info("Running in sequential mode (parallel=False)")
+        return None
+    
+    logger.info(f"Setting up Dask cluster with {n_workers} workers, {threads_per_worker} threads per worker")
+    cluster = LocalCluster(
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
+        memory_limit='auto',
+    )
+    client = Client(cluster)
+    logger.info(f"Dask dashboard: {client.dashboard_link}")
+    
+    return client
 
-    start_time = time.time()
-    logger.info(f"Starting NetCDF to HEALPix Zarr conversion: ...")
-
-    zoom = 8
-    version = 'v1'
-
-    # Input directories and filenames
-    dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/scream2D_hrly_mcsmask_hp8_v1.zarr"
-    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/"
-    basename_ar = "scream2D_ne120_hp8_fast.ar_filtered_nodes.for_Lexie"
-
-    # Output Zarr file
-    out_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
-    out_basename = f"scream2D_allmasks_hp{zoom}_{version}.zarr"
-    out_zarr = f"{out_dir}{out_basename}"
-
-    parallel = False
-    n_workers = 128
-    threads_per_worker = 1
-
-    if parallel:
-        # Set Dask temporary directory for workers
-        dask_tmp_dir = "/tmp"
-        dask.config.set({'temporary-directory': dask_tmp_dir})
-        # Local cluster
-        cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker)
-        client = Client(cluster)
-        client.run(setup_logging)
-
-    # Get client if available
-    try:
-        from dask.distributed import get_client
-        client = get_client()
-        logger.info(f"Using existing Dask client with {len(client.scheduler_info()['workers'])} workers")
-    except ValueError:
-        logger.warning("No Dask client found, continuing without explicit client")
-        client = None
-
-    # ---------- FIND INPUT FILES ----------
-    files_ar = sorted(glob.glob(f"{dir_ar}{basename_ar}*.nc"))
-    logger.info(f"Number of AR files: {len(files_ar)}")
-
-    # ---------- READ INPUT FILES ----------
+def get_datasets(dir_mcs, files_ar, parallel=False, logger=None):
+    """
+    Load datasets from files
+    
+    Args:
+        dir_mcs: str
+            Directory containing MCS zarr store
+        files_ar: list
+            List of AR NetCDF files
+        parallel: bool
+            Whether to use parallel processing
+        logger: logging.Logger
+            Logger for status messages
+            
+    Returns:
+        tuple: (ds_mcs, ds_ar) datasets
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    # Read AR files
     logger.info("Reading AR files...")
-    # Open as a lazy dataset
     ds_ar = xr.open_mfdataset(
         files_ar,
         combine="by_coords",
@@ -301,19 +308,69 @@ if __name__ == "__main__":
         mask_and_scale=False,
     )
     logger.info(f"Finished reading AR files.")
-
+    
+    # Read MCS file
     logger.info("Reading MCS file...")
-    # Open as a lazy dataset
     ds_mcs = xr.open_zarr(
         dir_mcs,
         consolidated=True,
         mask_and_scale=False,
     )
     logger.info(f"Finished reading MCS file")
+    
+    return ds_mcs, ds_ar
 
-    # Combine masks and write to Zarr
-    ds = combine_masks(ds_mcs, ds_ar, client=client, out_zarr=out_zarr, logger=logger)
+def main():
+    """Main function to run the mask combination process"""
+    # Set up logging
+    setup_logging()
+    logger = logging.getLogger(__name__)
 
+    start_time = time.time()
+    logger.info("Starting tracking mask combination...")
+    
+    # Configuration parameters
+    zoom = 8
+    version = 'v1'
+    parallel = False
+    n_workers = 128
+    threads_per_worker = 1
+    
+    # Input/output paths
+    dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/scream2D_hrly_mcsmask_hp8_v1.zarr"
+    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/"
+    basename_ar = "scream2D_ne120_hp8_fast.ar_filtered_nodes.for_Lexie"
+    
+    out_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
+    out_basename = f"scream2D_allmasks_hp{zoom}_{version}.zarr"
+    out_zarr = f"{out_dir}{out_basename}"
+    
+    # Setup Dask client
+    client = setup_dask_client(parallel, n_workers, threads_per_worker, logger)
+    
+    try:
+        # Find input files
+        files_ar = sorted(glob.glob(f"{dir_ar}{basename_ar}*.nc"))
+        logger.info(f"Number of AR files: {len(files_ar)}")
+        
+        # Load datasets
+        ds_mcs, ds_ar = get_datasets(dir_mcs, files_ar, parallel, logger)
+        
+        # Process and write output
+        ds = combine_masks(ds_mcs, ds_ar, client=client, out_zarr=out_zarr, logger=logger)
+        
+        # Cleanup
+        ds_mcs.close()
+        ds_ar.close()
+        if ds is not None:
+            ds.close()
+            
+    finally:
+        # Always cleanup client
+        if client and parallel:
+            logger.info("Shutting down Dask client")
+            client.close()
+    
     # Log completion time
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -321,4 +378,5 @@ if __name__ == "__main__":
     minutes, seconds = divmod(rem, 60)
     logger.info(f"Combine completed in {int(hours):02}:{int(minutes):02}:{int(seconds):02} (hh:mm:ss).")
 
-    # import pdb; pdb.set_trace()
+if __name__ == "__main__":
+    main()
