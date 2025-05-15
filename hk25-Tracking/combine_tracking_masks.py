@@ -42,9 +42,9 @@ def combine_masks(ds_mcs, ds_ar, ds_tc, ds_etc, client=None, out_zarr=None, logg
 
     drop_var_list = ['ccs_mask', 'pr']
     rename_dict = {
-        'AR_binary_tag': 'ar_mask',
-        'TC_binary_tag': 'tc_mask',
-        'ETC_binary_tag': 'etc_mask',
+        'AR_count_index': 'ar_mask',
+        'TC_count_index': 'tc_mask',
+        'ETC_count_index': 'etc_mask',
     }
 
     # Check the calendar type of the time coordinate in ds_ar
@@ -90,7 +90,7 @@ def combine_masks(ds_mcs, ds_ar, ds_tc, ds_etc, client=None, out_zarr=None, logg
             if var in ds.variables:
                 logger.info(f"Dropping {var} from dataset {i}")
                 datasets[i] = datasets[i].drop_vars(var)
-    
+
     # Merge the datasets
     ds = xr.merge(datasets, combine_attrs='drop_conflicts', compat='override')
     logger.info(f"Successfully merged datasets with {len(common_times)} common time points")
@@ -415,21 +415,16 @@ def main():
     # Configuration parameters
     zoom = 8
     version = 'v1'
-    parallel = False
+    parallel = True
     n_workers = 32
     threads_per_worker = 4
     
     # Input/output paths
     dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/scream2D_hrly_mcsmask_hp8_v1.zarr"
-    # dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/"
-    # basename_ar = "scream2D_ne120_hp8_fast.ar_filtered_nodes.for_Lexie"
-    # basename_tc = "scream2D_ne120_hp8_fast.tc_filtered_nodes.for_Lexie"
-    # basename_etc = "scream2D_ne120_hp8_fast.etc_filtered_nodes.for_Lexie"
-    # dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/for_zhe/"
     dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/scream_1year_test/"
-    basename_ar = "AR_filt_nodes_scream2D_ne120_inst_ivt_hp8."
-    basename_tc = "TC_filt_nodes_scream2D_ne120_inst_ivt_hp8."
-    basename_etc = "ETC_filt_nodes_scream2D_ne120_inst_ivt_hp8."
+    basename_ar = "AR_tracks_scream2D_ne120_inst_ivt_hp8."
+    basename_tc = "TC_tracks_scream2D_ne120_inst_ivt_hp8."
+    basename_etc = "ETC_tracks_scream2D_ne120_inst_ivt_hp8."
     
     # Output paths
     out_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
