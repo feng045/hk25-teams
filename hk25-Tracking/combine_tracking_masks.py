@@ -349,39 +349,48 @@ def get_datasets(dir_mcs, files_ar, files_tc, files_etc, parallel=False, logger=
     """
     if logger is None:
         logger = logging.getLogger(__name__)
+    
+    def process_dataset(files, name):
+        """Helper to process each dataset with consistent error handling"""
+        logger.info(f"Reading {name} files...")
         
-    # Read AR files
-    logger.info("Reading AR files...")
-    ds_ar = xr.open_mfdataset(
-        files_ar,
-        combine="by_coords",
-        parallel=parallel,
-        chunks={},
-        mask_and_scale=False,
-    )
-    logger.info(f"Finished reading AR files.")
-
-    # Read TC files
-    logger.info("Reading TC files...")
-    ds_tc = xr.open_mfdataset(
-        files_tc,
-        combine="by_coords",
-        parallel=parallel,
-        chunks={},
-        mask_and_scale=False,
-    )
-    logger.info(f"Finished reading TC files.")
-
-    # Read ETC files
-    logger.info("Reading ETC files...")
-    ds_etc = xr.open_mfdataset(
-        files_etc,
-        combine="by_coords",
-        parallel=parallel,
-        chunks={},
-        mask_and_scale=False,
-    )
-    logger.info(f"Finished reading ETC files.")
+        # Process each file individually, then concatenate
+        datasets = []
+        for file in files:
+            try:
+                ds_single = xr.open_dataset(
+                    file,
+                    chunks={},
+                    mask_and_scale=False,
+                )
+                datasets.append(ds_single)
+            except Exception as e:
+                logger.warning(f"Error opening {file}: {e}")
+                continue
+        
+        if not datasets:
+            raise ValueError(f"Could not open any {name} files")
+        
+        # Concatenate along time dimension
+        ds = xr.concat(datasets, dim="time")
+        
+        # Sort time values to ensure monotonic order
+        logger.info(f"Sorting {name} dataset by time")
+        ds = ds.sortby('time')
+        
+        # Check for and remove duplicate time values
+        _, index = np.unique(ds['time'].values, return_index=True)
+        if len(index) < len(ds['time']):
+            logger.warning(f"Found {len(ds['time']) - len(index)} duplicate time values in {name} files")
+            ds = ds.isel(time=sorted(index))
+    
+        logger.info(f"Finished reading {name} files.")
+        return ds
+        
+    # Process each dataset using our helper function
+    ds_ar = process_dataset(files_ar, "AR")
+    ds_tc = process_dataset(files_tc, "TC")
+    ds_etc = process_dataset(files_etc, "ETC")
     
     # Read MCS file
     logger.info("Reading MCS file...")
@@ -406,7 +415,7 @@ def main():
     # Configuration parameters
     zoom = 8
     version = 'v1'
-    parallel = True
+    parallel = False
     n_workers = 32
     threads_per_worker = 4
     
