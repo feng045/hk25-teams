@@ -2,6 +2,7 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import os
+import cftime
 import glob
 import time
 import logging
@@ -13,7 +14,7 @@ import dask
 from dask.distributed import Client, LocalCluster
 
 #-------------------------------------------------------------------
-def combine_masks(ds_mcs, ds_ar, client=None, out_zarr=None, logger=None):
+def combine_masks(ds_mcs, ds_ar, ds_tc, ds_etc, client=None, out_zarr=None, logger=None):
     """
     Combine MCS and AR tracking datasets and write to Zarr store.
     
@@ -22,6 +23,10 @@ def combine_masks(ds_mcs, ds_ar, client=None, out_zarr=None, logger=None):
             MCS tracking dataset
         ds_ar: xarray.Dataset
             AR tracking dataset
+        ds_tc: xarray.Dataset
+            TC tracking dataset
+        ds_etc: xarray.Dataset
+            ETC tracking dataset
         client: dask.distributed.Client, optional
             Dask client for distributed computation
         out_zarr: str, optional
@@ -35,58 +40,81 @@ def combine_masks(ds_mcs, ds_ar, client=None, out_zarr=None, logger=None):
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    drop_var_list = ['ccs_mask']
+    drop_var_list = ['ccs_mask', 'pr']
     rename_dict = {
         'AR_binary_tag': 'ar_mask',
-        # 'TC_binary_tag': 'tc_mask',
+        'TC_binary_tag': 'tc_mask',
+        'ETC_binary_tag': 'etc_mask',
     }
 
-    # Check the calendar type of the time coordinate
+    # Check the calendar type of the time coordinate in ds_ar
     calendar = ds_ar['time'].dt.calendar
 
-    # Convert DataSet time coordinate to standard calendar
+    # Convert ds_mcs time coordinate to match ds_ar calendar
     if calendar not in ['proleptic_gregorian', 'gregorian', 'standard']:
-        logger.info(f"Converting {calendar} calendar to proleptic_gregorian calendar")
-        ds_ar['time'] = convert_cftime_to_standard(ds_ar['time'].values)
+        logger.info(f"Converting ds_mcs time from standard calendar to {calendar} calendar")
+        converted_times = convert_to_matching_calendar(ds_mcs['time'].values, calendar)
+        
+        # Replace the time values in ds_mcs with the converted ones
+        ds_mcs = ds_mcs.assign_coords(time=converted_times)
+        logger.info(f"Successfully converted ds_mcs time to {calendar} calendar")
     else:
-        logger.info(f"Dataset already uses standard calendar: {calendar}")
-
-    # Find common time range
-    common_times = sorted(set(ds_mcs['time'].values).intersection(set(ds_ar['time'].values)))
+        logger.info(f"Both datasets use standard calendar: {calendar}, no conversion needed")
+    
+    # Find common time range across all three datasets
+    common_times = sorted(set(ds_mcs['time'].values)
+                         .intersection(set(ds_ar['time'].values))
+                         .intersection(set(ds_tc['time'].values))
+                         .intersection(set(ds_etc['time'].values)))
     if not common_times:
-        logger.warning("No common time values between datasets!")
+        logger.warning("No common time values between all datasets!")
         return None
     else:
-        # Select only the common times in both datasets
+        # Select only the common times in all datasets
         ds_mcs = ds_mcs.sel(time=common_times)
         ds_ar = ds_ar.sel(time=common_times)
+        ds_tc = ds_tc.sel(time=common_times)
+        ds_etc = ds_etc.sel(time=common_times)
 
+    # Fix for lat/lon coordinates issue: ensure consistent treatment
+    datasets = [ds_mcs, ds_ar, ds_tc, ds_etc]
+    # Fix dimensions and coordinates for consistent merging
+    for i, ds in enumerate(datasets):
+        # Rename 'ncol' to 'cell' if it exists to standardize dimensions
+        if 'ncol' in ds.dims:
+            logger.info(f"Renaming dimension 'ncol' to 'cell' in dataset {i}")
+            datasets[i] = ds.rename({'ncol': 'cell'})
+        
+        # Drop lat and lon variables from all datasets
+        for var in ['lat', 'lon']:
+            if var in ds.variables:
+                logger.info(f"Dropping {var} from dataset {i}")
+                datasets[i] = datasets[i].drop_vars(var)
+    
     # Merge the datasets
-    ds = xr.merge([ds_mcs, ds_ar], combine_attrs='drop_conflicts')
+    ds = xr.merge(datasets, combine_attrs='drop_conflicts', compat='override')
     logger.info(f"Successfully merged datasets with {len(common_times)} common time points")
 
     # Rename variables, drop unwanted ones in the DataSet
-    ds = ds.rename(rename_dict).drop_vars(drop_var_list)
+    ds = ds.rename(rename_dict).drop_vars(drop_var_list, errors='ignore')
 
     # TODO: Modify global attributes if needed
     # ds.attrs['history'] = f"Created on {time.ctime()} by combining MCS and AR tracking data"
     
     # Write to Zarr
     if out_zarr:
-        write_zarr(ds, ds_mcs, out_zarr, client=client, logger=logger)
+        write_zarr(ds, out_zarr, client=client, logger=logger)
     
     return ds
 
 #-------------------------------------------------------------------
-def write_zarr(ds, ds_mcs, out_zarr, client=None, logger=None):
+def write_zarr(ds, out_zarr, client=None, logger=None):
     """
     Write dataset to Zarr with optimized chunking for HEALPix grid.
     
     Args:
         ds: xarray.Dataset
             Dataset to write
-        ds_mcs: xarray.Dataset
-            MCS dataset with HEALPix attributes
         out_zarr: str
             Output Zarr store path
         client: dask.distributed.Client, optional
@@ -101,7 +129,7 @@ def write_zarr(ds, ds_mcs, out_zarr, client=None, logger=None):
         logger = logging.getLogger(__name__)
 
     # Optimize cell chunking for HEALPix grid
-    zoom_level = zoom_level_from_nside(ds_mcs.crs.attrs['healpix_nside'])
+    zoom_level = zoom_level_from_nside(ds.crs.attrs['healpix_nside'])
     chunksize_time = 24
     chunksize_cell = 12 * 4**zoom_level
     
@@ -131,7 +159,7 @@ def write_zarr(ds, ds_mcs, out_zarr, client=None, logger=None):
     # Create a delayed task for Zarr writing
     write_task = chunked_hp.to_zarr(
         out_zarr,
-        mode="w",        
+        mode="w",
         consolidated=True,  # Enable for better performance when reading
         compute=False      # Create a delayed task
     )
@@ -171,48 +199,68 @@ def write_zarr(ds, ds_mcs, out_zarr, client=None, logger=None):
     logger.info(f"Zarr file complete: {out_zarr}")
 
 #-------------------------------------------------------------------
-def convert_cftime_to_standard(cftime_times):
+def convert_to_matching_calendar(std_times, target_calendar):
     """
-    Convert cftime objects to pandas Timestamps (proleptic_gregorian calendar)
+    Convert standard calendar (proleptic_gregorian) timestamps to match a target calendar.
     
     Args:
-        cftime_times: cftime object or array-like
-            Single cftime datetime object or array of cftime datetime objects
-    
+        std_times: array of numpy.datetime64, pandas.DatetimeIndex or pandas.Timestamp
+            Timestamps with standard (proleptic_gregorian) calendar
+        target_calendar: str
+            Target calendar to convert to ('365_day', '360_day', 'noleap', etc.)
+            
     Returns:
-        pandas.DatetimeIndex or pandas.Timestamp: 
-            DatetimeIndex with proleptic_gregorian calendar if input is array-like,
-            or a single Timestamp if input is a single cftime object
+        cftime.datetime objects using the target calendar
     """
-    # Check if input is a single cftime object (has year attribute directly)
-    is_single_object = hasattr(cftime_times, 'year')
+
     
-    # If single object, convert it to a list with one element
+    # Initialize the appropriate cftime date type based on target calendar
+    calendar_types = {
+        '365_day': cftime.DatetimeNoLeap,
+        'noleap': cftime.DatetimeNoLeap,
+        '360_day': cftime.Datetime360Day,
+        'all_leap': cftime.DatetimeAllLeap,
+        'julian': cftime.DatetimeJulian,
+        # Add other calendars as needed
+    }
+    
+    if target_calendar in ['proleptic_gregorian', 'gregorian', 'standard']:
+        # No conversion needed
+        return std_times
+    
+    if target_calendar not in calendar_types:
+        raise ValueError(f"Unsupported calendar: {target_calendar}")
+        
+    datetime_type = calendar_types[target_calendar]
+    
+    # Check if input is a single timestamp
+    is_single_object = not hasattr(std_times, '__iter__') or isinstance(std_times, pd.Timestamp)
+    
+    # Convert to list for uniform processing
+    times_list = [std_times] if is_single_object else std_times
+    
+    # Convert each timestamp to the target calendar
+    converted_times = []
+    for t in times_list:
+        # Convert numpy.datetime64 to pandas.Timestamp which has the necessary attributes
+        if isinstance(t, np.datetime64):
+            ts = pd.Timestamp(t)
+            converted_times.append(datetime_type(
+                ts.year, ts.month, ts.day, 
+                ts.hour, ts.minute, ts.second
+            ))
+        else:
+            # For pandas.Timestamp or datetime objects that already have year, month attributes
+            converted_times.append(datetime_type(
+                t.year, t.month, t.day, 
+                t.hour, t.minute, t.second
+            ))
+    
+    # Return a single object or a list based on input type
     if is_single_object:
-        cftime_list = [cftime_times]
+        return converted_times[0]
     else:
-        cftime_list = cftime_times
-    
-    # Extract date components from cftime objects
-    timestamps = []
-    for t in cftime_list:
-        # Extract time components from the cftime object
-        dt_components = {
-            'year': t.year,
-            'month': t.month,
-            'day': t.day,
-            'hour': t.hour if hasattr(t, 'hour') else 0,
-            'minute': t.minute if hasattr(t, 'minute') else 0,
-            'second': t.second if hasattr(t, 'second') else 0
-        }
-        # Create a pandas timestamp with the same components (proleptic_gregorian)
-        timestamps.append(pd.Timestamp(**dt_components))
-    
-    # Return either a single Timestamp or a DatetimeIndex based on input type
-    if is_single_object:
-        return timestamps[0]
-    else:
-        return pd.DatetimeIndex(timestamps)
+        return converted_times
 
 #-------------------------------------------------------------------
 def zoom_level_from_nside(nside):
@@ -278,7 +326,7 @@ def setup_dask_client(parallel, n_workers, threads_per_worker, logger=None):
     
     return client
 
-def get_datasets(dir_mcs, files_ar, parallel=False, logger=None):
+def get_datasets(dir_mcs, files_ar, files_tc, files_etc, parallel=False, logger=None):
     """
     Load datasets from files
     
@@ -287,6 +335,10 @@ def get_datasets(dir_mcs, files_ar, parallel=False, logger=None):
             Directory containing MCS zarr store
         files_ar: list
             List of AR NetCDF files
+        files_tc: list
+            List of TC NetCDF files
+        files_etc: list
+            List of ETC NetCDF files
         parallel: bool
             Whether to use parallel processing
         logger: logging.Logger
@@ -308,6 +360,28 @@ def get_datasets(dir_mcs, files_ar, parallel=False, logger=None):
         mask_and_scale=False,
     )
     logger.info(f"Finished reading AR files.")
+
+    # Read TC files
+    logger.info("Reading TC files...")
+    ds_tc = xr.open_mfdataset(
+        files_tc,
+        combine="by_coords",
+        parallel=parallel,
+        chunks={},
+        mask_and_scale=False,
+    )
+    logger.info(f"Finished reading TC files.")
+
+    # Read ETC files
+    logger.info("Reading ETC files...")
+    ds_etc = xr.open_mfdataset(
+        files_etc,
+        combine="by_coords",
+        parallel=parallel,
+        chunks={},
+        mask_and_scale=False,
+    )
+    logger.info(f"Finished reading ETC files.")
     
     # Read MCS file
     logger.info("Reading MCS file...")
@@ -318,7 +392,7 @@ def get_datasets(dir_mcs, files_ar, parallel=False, logger=None):
     )
     logger.info(f"Finished reading MCS file")
     
-    return ds_mcs, ds_ar
+    return ds_mcs, ds_ar, ds_tc, ds_etc
 
 def main():
     """Main function to run the mask combination process"""
@@ -332,15 +406,23 @@ def main():
     # Configuration parameters
     zoom = 8
     version = 'v1'
-    parallel = False
-    n_workers = 128
-    threads_per_worker = 1
+    parallel = True
+    n_workers = 32
+    threads_per_worker = 4
     
     # Input/output paths
     dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/scream2D_hrly_mcsmask_hp8_v1.zarr"
-    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/"
-    basename_ar = "scream2D_ne120_hp8_fast.ar_filtered_nodes.for_Lexie"
+    # dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/"
+    # basename_ar = "scream2D_ne120_hp8_fast.ar_filtered_nodes.for_Lexie"
+    # basename_tc = "scream2D_ne120_hp8_fast.tc_filtered_nodes.for_Lexie"
+    # basename_etc = "scream2D_ne120_hp8_fast.etc_filtered_nodes.for_Lexie"
+    # dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/for_zhe/"
+    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/scream_1year_test/"
+    basename_ar = "AR_filt_nodes_scream2D_ne120_inst_ivt_hp8."
+    basename_tc = "TC_filt_nodes_scream2D_ne120_inst_ivt_hp8."
+    basename_etc = "ETC_filt_nodes_scream2D_ne120_inst_ivt_hp8."
     
+    # Output paths
     out_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
     out_basename = f"scream2D_allmasks_hp{zoom}_{version}.zarr"
     out_zarr = f"{out_dir}{out_basename}"
@@ -351,13 +433,17 @@ def main():
     try:
         # Find input files
         files_ar = sorted(glob.glob(f"{dir_ar}{basename_ar}*.nc"))
+        files_tc = sorted(glob.glob(f"{dir_ar}{basename_tc}*.nc"))
+        files_etc = sorted(glob.glob(f"{dir_ar}{basename_etc}*.nc"))
         logger.info(f"Number of AR files: {len(files_ar)}")
+        logger.info(f"Number of TC files: {len(files_tc)}")
+        logger.info(f"Number of ETC files: {len(files_etc)}")
         
         # Load datasets
-        ds_mcs, ds_ar = get_datasets(dir_mcs, files_ar, parallel, logger)
-        
+        ds_mcs, ds_ar, ds_tc, ds_etc = get_datasets(dir_mcs, files_ar, files_tc, files_etc, parallel, logger)
+
         # Process and write output
-        ds = combine_masks(ds_mcs, ds_ar, client=client, out_zarr=out_zarr, logger=logger)
+        ds = combine_masks(ds_mcs, ds_ar, ds_tc, ds_etc, client=client, out_zarr=out_zarr, logger=logger)
         
         # Cleanup
         ds_mcs.close()
