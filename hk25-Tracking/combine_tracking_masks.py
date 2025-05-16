@@ -1,16 +1,10 @@
 import xarray as xr
 import numpy as np
 import pandas as pd
-import os
 import cftime
 import glob
 import time
 import logging
-# import intake
-# import requests
-# import easygems.healpix as egh
-# from functools import partial
-import dask
 from dask.distributed import Client, LocalCluster
 
 #-------------------------------------------------------------------
@@ -421,7 +415,7 @@ def main():
     
     # Input/output paths
     dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/scream2D_hrly_mcsmask_hp8_v1.zarr"
-    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/scream_1year_test/"
+    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/scream_1year_test2/"
     basename_ar = "AR_tracks_scream2D_ne120_inst_ivt_hp8."
     basename_tc = "TC_tracks_scream2D_ne120_inst_ivt_hp8."
     basename_etc = "ETC_tracks_scream2D_ne120_inst_ivt_hp8."
