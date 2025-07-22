@@ -1,0 +1,42 @@
+---
+# Configuration file for different data sources
+catalog_file: "https://digital-earths-global-hackathon.github.io/catalog/catalog.yaml"
+
+# SCREAM model configuration
+scream_ne120:
+  source_name: scream
+  catalog_location: NERSC
+  catalog_params:
+    zoom: 8
+  varname_precip_liq: pr
+  varname_precip_ice: prs
+  pr_convert_factor: 3600000.0  # Convert from [m/s] to [mm/h]
+  start_datetime: 2019-08-01T00:00
+  end_datetime: 2020-08-31T23:59
+
+# ICON model configuration  
+icon_d3hp003:
+  source_name: icon_d3hp003
+  catalog_location: NERSC
+  catalog_params:
+    zoom: 8
+    time: PT6H
+    time_method: mean
+  varname_precip_liq: pr
+  varname_precip_ice: prs
+  pr_convert_factor: 3600.0  # Convert flux unit to [mm/h]
+  start_datetime: 2020-01-02T00:00
+  end_datetime: 2020-12-31T23:59
+
+# CASESM2 model configuration  
+casesm2_10km_nocumulus:
+  source_name: casesm2_10km_nocumulus
+  catalog_location: NERSC
+  catalog_params:
+    zoom: 8
+    time: PT3H
+  varname_precip_liq: pr
+  varname_precip_ice: prs
+  pr_convert_factor: 3600.0  # Convert flux unit to [mm/h]
+  start_datetime: 2020-03-01T00:00
+  end_datetime: 2021-02-28T23:59

@@ -2,7 +2,7 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import cftime
-import glob
+import os, glob
 import time
 import logging
 from dask.distributed import Client, LocalCluster
@@ -10,7 +10,7 @@ from dask.distributed import Client, LocalCluster
 #-------------------------------------------------------------------
 def combine_masks(ds_mcs, ds_ar, ds_tc, ds_etc, client=None, out_zarr=None, logger=None):
     """
-    Combine MCS and AR tracking datasets and write to Zarr store.
+    Combine tracking datasets and write to Zarr store.
     
     Args:
         ds_mcs: xarray.Dataset
@@ -414,25 +414,44 @@ def main():
     threads_per_worker = 4
     
     # Input/output paths
-    dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/scream2D_hrly_mcsmask_hp8_v1.zarr"
-    dir_ar = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/scream_1year_test2/"
-    basename_ar = "AR_tracks_scream2D_ne120_inst_ivt_hp8."
-    basename_tc = "TC_tracks_scream2D_ne120_inst_ivt_hp8."
-    basename_etc = "ETC_tracks_scream2D_ne120_inst_ivt_hp8."
-    
+    # source_name = "scream"
+    # source_res = f"ne120_inst_ivt_hp{zoom}"
+    # dir_mcs = f"/pscratch/sd/w/wcmca1/scream-cess-healpix/mcs_tracking_hp9/mcstracking/{source_name}2D_hrly_mcsmask_hp8_v1.zarr"
+    # dir_te = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/scream_1year_test/"
+    # basename_ar = f"AR_tracks_{source_name}2D_ne120_inst_ivt_hp8."
+    # basename_tc = f"TC_tracks_{source_name}2D_ne120_inst_ivt_hp8."
+    # basename_etc = f"ETC_tracks_{source_name}2D_ne120_inst_ivt_hp8."
+
+    # source_name = "icon_d3hp003"
+    # source_res = f"hp{zoom}_PT6H"
+    # dir_mcs = f"/pscratch/sd/w/wcmca1/hackathon/mcs/{source_name}/mcstracking/icon_hrly_mcsmask_hp{zoom}_v1.zarr"
+    # dir_te = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/{source_name}_1year_testpy/"
+    # basename_ar = f"AR_tracks_{source_name}_{source_res}."
+    # basename_tc = f"TC_tracks_{source_name}_{source_res}."
+    # basename_etc = f"ETC_tracks_{source_name}_{source_res}."
+
+    source_name = "casesm2_10km_nocumulus"
+    source_res = f"hp{zoom}_H"
+    dir_mcs = f"/pscratch/sd/w/wcmca1/hackathon/mcs/{source_name}/mcstracking/casesm2_hrly_mcsmask_hp{zoom}_v1.zarr"
+    dir_te = f"/pscratch/sd/b/beharrop/kmscale_hackathon/hackathon_pre/{source_name}_testpy/"
+    basename_ar = f"AR_tracks_{source_name}_{source_res}."
+    basename_tc = f"TC_tracks_{source_name}_{source_res}."
+    basename_etc = f"ETC_tracks_{source_name}_{source_res}."
+
     # Output paths
-    out_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
-    out_basename = f"scream2D_allmasks_hp{zoom}_{version}.zarr"
+    out_dir = "/pscratch/sd/w/wcmca1/hackathon/allmasks/"
+    out_basename = f"{source_name}_allmasks_hp{zoom}_{version}.zarr"
     out_zarr = f"{out_dir}{out_basename}"
+    os.makedirs(out_dir, exist_ok=True)
     
     # Setup Dask client
     client = setup_dask_client(parallel, n_workers, threads_per_worker, logger)
     
     try:
         # Find input files
-        files_ar = sorted(glob.glob(f"{dir_ar}{basename_ar}*.nc"))
-        files_tc = sorted(glob.glob(f"{dir_ar}{basename_tc}*.nc"))
-        files_etc = sorted(glob.glob(f"{dir_ar}{basename_etc}*.nc"))
+        files_ar = sorted(glob.glob(f"{dir_te}{basename_ar}*.nc"))
+        files_tc = sorted(glob.glob(f"{dir_te}{basename_tc}*.nc"))
+        files_etc = sorted(glob.glob(f"{dir_te}{basename_etc}*.nc"))
         logger.info(f"Number of AR files: {len(files_ar)}")
         logger.info(f"Number of TC files: {len(files_tc)}")
         logger.info(f"Number of ETC files: {len(files_etc)}")
@@ -446,6 +465,8 @@ def main():
         # Cleanup
         ds_mcs.close()
         ds_ar.close()
+        ds_tc.close()
+        ds_etc.close()
         if ds is not None:
             ds.close()
             

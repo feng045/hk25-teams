@@ -1,5 +1,6 @@
 import numpy as np
 import sys, os
+import yaml
 import xarray as xr
 import pandas as pd
 import time
@@ -18,27 +19,29 @@ def parse_cmd_args():
         description="Calculate monthly MCS precipitation statistics."
     )
     parser.add_argument("-c", "--config", help="yaml config file for tracking", required=True)
-    parser.add_argument("-s", "--start", help="first time to process, format=YYYY-mm-ddTHH", required=True)
-    parser.add_argument("-e", "--end", help="last time to process, format=YYYY-mm-ddTHH", required=True)
-    parser.add_argument("--zoom", help="HEALPix zoom level", type=int, default=None)
-    parser.add_argument("--nworkers", help="number of Dask workers", type=int, default=12)
-    parser.add_argument("--threads", help="threads per worker", type=int, default=10)
-    parser.add_argument("--memory", help="memory limit per worker, e.g. '40GB' (default: auto)", default=None)
-    parser.add_argument("--chunk_days", help="number of days to process in each chunk", type=int, default=5)
-    parser.add_argument("--pcp_thresh", help="precipitation threshold in mm/h", type=float, default=2.0)
+    # parser.add_argument("-s", "--start", help="first time to process, format=YYYY-mm-ddTHH", required=True)
+    # parser.add_argument("-e", "--end", help="last time to process, format=YYYY-mm-ddTHH", required=True)
+    parser.add_argument("--source", help="catalog source name from config file", required=True)
+    # parser.add_argument("--zoom", help="HEALPix zoom level", type=int, default=None)
+    # parser.add_argument("--nworkers", help="number of Dask workers", type=int, default=14)
+    # parser.add_argument("--threads", help="threads per worker", type=int, default=4)
+    # parser.add_argument("--memory", help="memory limit per worker, e.g. '40GB' (default: auto)", default=None)
+    # parser.add_argument("--chunk_days", help="number of days to process in each chunk", type=int, default=5)
+    # parser.add_argument("--pcp_thresh", help="precipitation threshold in mm/h", type=float, default=2.0)
     args = parser.parse_args()
 
     # Put arguments in a dictionary
     args_dict = {
         'config_file': args.config,
-        'start_datetime': args.start,
-        'end_datetime': args.end,
-        'zoom': args.zoom,
-        'n_workers': args.nworkers,
-        'threads_per_worker': args.threads,
-        'memory_limit': args.memory,
-        'chunk_days': args.chunk_days,
-        'pcp_thresh': args.pcp_thresh,
+        # 'start_datetime': args.start,
+        # 'end_datetime': args.end,
+        'source': args.source,
+        # 'zoom': args.zoom,
+        # 'n_workers': args.nworkers,
+        # 'threads_per_worker': args.threads,
+        # 'memory_limit': args.memory,
+        # 'chunk_days': args.chunk_days,
+        # 'pcp_thresh': args.pcp_thresh,
     }
 
     return args_dict
@@ -104,6 +107,28 @@ def setup_dask_client(parallel, n_workers, threads_per_worker, logger=None):
     logger.info(f"Dask dashboard: {client.dashboard_link}")
     
     return client
+
+def load_config(config_file, catalog_source):
+    """
+    Load configuration from YAML file for a specific catalog source.
+    
+    Args:
+        config_file: str
+            Path to the YAML configuration file
+        catalog_source: str
+            The catalog source key to load configuration for
+            
+    Returns:
+        dict: Configuration dictionary for the specified source
+    """
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    if catalog_source not in config:
+        raise ValueError(f"Catalog source '{catalog_source}' not found in config file. "
+                        f"Available sources: {list(config.keys())}")
+    
+    return config[catalog_source]
 
 def process_month_chunked(month_ds, chunk_days=5, pcp_thresh=2.0):
     """Process one month of data in time chunks to reduce memory pressure"""
@@ -455,6 +480,132 @@ def write_netcdf(results, ds, output_filename, zoom, pcp_thresh, logger=None):
     return dsout
 
 
+def subset_time_range(ds, start_datetime_str, end_datetime_str, logger=None):
+    """
+    Subset dataset to a time range, handling different calendar types robustly.
+    
+    Args:
+        ds: xarray.Dataset
+            Dataset to subset
+        start_datetime_str: str
+            Start datetime string in format 'YYYY-MM-DDTHH:MM'
+        end_datetime_str: str
+            End datetime string in format 'YYYY-MM-DDTHH:MM'
+        logger: logging.Logger, optional
+            Logger for status messages
+            
+    Returns:
+        xarray.Dataset: Time-subsetted dataset
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    logger.info(f"Subsetting time range: {start_datetime_str} to {end_datetime_str}")
+    
+    # Parse datetime strings
+    start_dt = pd.to_datetime(start_datetime_str)
+    end_dt = pd.to_datetime(end_datetime_str)
+    
+    # Get the calendar type of the dataset
+    time_values = ds.time.values
+    calendar_type = type(time_values[0]).__name__
+    
+    logger.info(f"Dataset uses calendar type: {calendar_type}")
+    
+    if calendar_type in ['datetime64', 'Timestamp']:
+        # Standard numpy datetime64 or pandas Timestamp
+        logger.info("Using standard datetime subsetting")
+        ds_subset = ds.sel(time=slice(start_datetime_str, end_datetime_str))
+        
+    elif 'cftime' in calendar_type.lower() or hasattr(time_values[0], 'calendar'):
+        # cftime objects (e.g., DatetimeNoLeap, Datetime360Day, etc.)
+        logger.info("Using cftime calendar subsetting")
+        
+        # Determine the specific cftime calendar
+        sample_time = time_values[0]
+        if hasattr(sample_time, 'calendar'):
+            calendar_name = sample_time.calendar
+        else:
+            # Infer calendar from type name
+            if 'NoLeap' in calendar_type:
+                calendar_name = 'noleap'
+            elif '360' in calendar_type:
+                calendar_name = '360_day'
+            elif 'Gregorian' in calendar_type:
+                calendar_name = 'gregorian'
+            else:
+                calendar_name = 'standard'
+        
+        logger.info(f"Detected cftime calendar: {calendar_name}")
+        
+        # Convert start/end times to cftime objects with matching calendar
+        try:
+            start_cftime = cftime.datetime(
+                start_dt.year, start_dt.month, start_dt.day,
+                start_dt.hour, start_dt.minute, start_dt.second,
+                calendar=calendar_name
+            )
+            end_cftime = cftime.datetime(
+                end_dt.year, end_dt.month, end_dt.day,
+                end_dt.hour, end_dt.minute, end_dt.second,
+                calendar=calendar_name
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create cftime objects with calendar {calendar_name}: {e}")
+            # Fallback: use the same type as the dataset
+            start_cftime = type(sample_time)(
+                start_dt.year, start_dt.month, start_dt.day,
+                start_dt.hour, start_dt.minute, start_dt.second
+            )
+            end_cftime = type(sample_time)(
+                end_dt.year, end_dt.month, end_dt.day,
+                end_dt.hour, end_dt.minute, end_dt.second
+            )
+        
+        # Create boolean mask for time selection
+        time_mask = (ds.time >= start_cftime) & (ds.time <= end_cftime)
+        ds_subset = ds.where(time_mask, drop=True)
+        
+    else:
+        # Fallback: try converting dataset times to pandas datetime for comparison
+        logger.warning(f"Unknown calendar type {calendar_type}, attempting fallback method")
+        
+        try:
+            # Convert dataset times to pandas datetime for comparison
+            if hasattr(time_values[0], 'year'):
+                # Has year, month, day attributes (cftime-like)
+                pd_times = [pd.Timestamp(t.year, t.month, t.day, 
+                                       getattr(t, 'hour', 0), 
+                                       getattr(t, 'minute', 0), 
+                                       getattr(t, 'second', 0)) 
+                           for t in time_values]
+            else:
+                # Try direct conversion
+                pd_times = pd.to_datetime(time_values)
+            
+            # Create boolean mask
+            time_mask = (pd.Series(pd_times) >= start_dt) & (pd.Series(pd_times) <= end_dt)
+            ds_subset = ds.isel(time=time_mask)
+            
+        except Exception as e:
+            logger.error(f"Fallback time subsetting failed: {e}")
+            logger.error("Using string-based selection as last resort")
+            ds_subset = ds.sel(time=slice(start_datetime_str, end_datetime_str))
+    
+    # Log results
+    original_times = len(ds.time)
+    subset_times = len(ds_subset.time)
+    logger.info(f"Time subsetting complete: {original_times} -> {subset_times} time steps")
+    
+    if subset_times == 0:
+        logger.warning("No time steps found in specified range!")
+    else:
+        first_time = ds_subset.time.values[0]
+        last_time = ds_subset.time.values[-1]
+        logger.info(f"Subset time range: {first_time} to {last_time}")
+    
+    return ds_subset
+
 def main():
     # Set up logging
     setup_logging()
@@ -465,9 +616,10 @@ def main():
     initial_memory = get_memory_usage()
     print(f"Initial memory usage: {initial_memory:.2f} GB")
 
-    # # Get the command-line arguments
-    # args_dict = parse_cmd_args()
-    # config_file = args_dict.get('config_file')
+    # Get the command-line arguments
+    args_dict = parse_cmd_args()
+    config_file = args_dict.get('config_file')
+    catalog_source = args_dict.get('source')
     # start_datetime = args_dict.get('start_datetime')
     # end_datetime = args_dict.get('end_datetime')
     # zoom = args_dict.get('zoom')
@@ -486,25 +638,41 @@ def main():
     parallel = True
     n_workers = 13
     threads_per_worker = 4
+    
+    # Load configuration for the specified source
+    config = load_config(config_file, catalog_source)
+    
+    # Extract configuration variables
+    # catalog_file = config.get('catalog_file')
+    source_name = config.get('source_name')
+    catalog_location = config.get('catalog_location', 'NERSC')
+    catalog_params = config.get('catalog_params', {}).copy()
+    varname_precip_liq = config.get('varname_precip_liq')
+    varname_precip_ice = config.get('varname_precip_ice')
+    pr_convert_factor = config.get('pr_convert_factor')
+    start_datetime = config.get('start_datetime')
+    end_datetime = config.get('end_datetime')
 
     # Catalog parameters
     catalog_file = "https://digital-earths-global-hackathon.github.io/catalog/catalog.yaml"
-    catalog_location = "NERSC"
-    catalog_source = "scream_ne120"
-    # Catalog parameters, can have multiple entries
-    catalog_params = {"zoom": zoom}
-    varname_precip_liq = "pr"   # Liquid precipitation variable name
-    varname_precip_ice = "prs"  # Ice precipitation variable name (if exists)
-    pr_convert_factor = 3600000.  # Convert precipitation flux from [m/s] to [mm/h]
+    # catalog_location = "NERSC"
 
     # Input combined mask file
-    in_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
-    in_basename = f"scream2D_allmasks_hp{zoom}_{version}.zarr"
+    # in_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/"
+    in_dir = "/pscratch/sd/w/wcmca1/hackathon/allmasks/"
+    in_basename = f"{source_name}_allmasks_hp{zoom}_{version}.zarr"
     in_zarr = f"{in_dir}{in_basename}"
 
-    output_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/monthly/"
+    # output_dir = "/pscratch/sd/w/wcmca1/scream-cess-healpix/monthly/"
+    output_dir = "/pscratch/sd/w/wcmca1/hackathon/allmasks/stats/monthly/"
     os.makedirs(output_dir, exist_ok=True)
-    output_filename = f"{output_dir}monthly_rainmap_by_featuretypes_hp{zoom}_{version}.nc"
+    output_filename = f"{output_dir}{source_name}_monthly_rainmap_by_featuretypes_hp{zoom}_{version}.nc"
+
+    logger.info(f"Using catalog source: {catalog_source}")
+    logger.info(f"Source name: {source_name}")
+    logger.info(f"Input file: {in_zarr}")
+    logger.info(f"Output file: {output_filename}")
+    # import pdb; pdb.set_trace()
 
     # Setup Dask client
     client = setup_dask_client(parallel, n_workers, threads_per_worker, logger)
@@ -512,26 +680,6 @@ def main():
     # Load the mask dataset
     ds = xr.open_zarr(in_zarr, consolidated=True)
     ds = ds.pipe(egh.attach_coords)
-
-    # # Check catalog file availability
-    # if catalog_file:
-    #     if catalog_file.startswith(('http://', 'https://')):
-    #         # Handle URL case
-    #         try:
-    #             response = requests.head(catalog_file, timeout=10)
-    #             if response.status_code >= 400:
-    #                 print(f"Catalog URL {catalog_file} returned status code {response.status_code}. Skipping remap.")
-    #                 sys.exit('Code will exit now.')
-    #         except requests.exceptions.RequestException as e:
-    #             print(f"Error accessing catalog URL {catalog_file}: {str(e)}. Skipping remap.")
-    #             sys.exit('Code will exit now.')
-    #     elif os.path.isfile(catalog_file) is False:
-    #         # Handle local file case
-    #         print(f"Catalog file {catalog_file} does not exist. Skipping remap.")
-    #         sys.exit('Code will exit now.')
-    # else:
-    #     print("Catalog file not specified in config. HEALPix remapping requires a catalog.")
-    #     sys.exit('Code will exit now.')
     
     # Load the HEALPix catalog
     print(f"Loading HEALPix catalog: {catalog_file}")
@@ -590,7 +738,7 @@ def main():
         ds = ds.assign_coords(time=new_times)
         logger.info("Calendar conversion complete")
 
-    # Find common time range across all three datasets
+    # Find common time range across all datasets
     common_times = sorted(set(ds_p['time'].values)
                          .intersection(set(ds['time'].values)))
     if not common_times:
@@ -602,10 +750,19 @@ def main():
         ds = ds.sel(time=common_times)
         # Add precipitation to the dataset
         ds["pr"] = pr
-    # import pdb; pdb.set_trace()
+    
+    # Subset to the specified time range using robust method
+    if start_datetime and end_datetime:
+        logger.info("Subsetting datasets to specified time range")
+        ds = subset_time_range(ds, start_datetime, end_datetime, logger)
+        
+        if len(ds.time) == 0:
+            logger.error("No data found in specified time range!")
+            return None
+    else:
+        logger.info("No time range specified, using all available data")
 
     # Group by month and apply the processing function
-    monthly_results = []
     monthly_groups = ds.resample(time='1MS')
 
     # Check if client exists for parallel processing
@@ -614,7 +771,8 @@ def main():
         logger.info("Running in parallel mode with Dask")
         delayed_results = []
         for month_start, month_ds in monthly_groups:
-            print(f"Processing month: {month_start.strftime('%Y-%m')}")
+            print(f"Processing month: {month_start}")
+            # print(f"Processing month: {month_start.strftime('%Y-%m')}")
             # Submit the processing job to the dask cluster
             delayed_result = client.submit(process_month_chunked, month_ds, chunk_days=chunk_days, pcp_thresh=pcp_thresh)
             delayed_results.append(delayed_result)
@@ -630,7 +788,8 @@ def main():
         logger.info("Running in serial mode")
         results = []
         for month_start, month_ds in monthly_groups:
-            print(f"Processing month: {month_start.strftime('%Y-%m')}")
+            print(f"Processing month: {month_start}")
+            # print(f"Processing month: {month_start.strftime('%Y-%m')}")
             # Process directly without Dask
             result = process_month_chunked(month_ds, chunk_days=chunk_days, pcp_thresh=pcp_thresh)
             results.append(result)
